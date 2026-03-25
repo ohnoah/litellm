@@ -19,6 +19,7 @@ import pytest
 import litellm
 from litellm import aembedding, completion, embedding, aresponses, responses
 from litellm.caching.caching import Cache
+from litellm.responses.streaming_iterator import CachedResponsesAPIStreamingIterator
 
 from unittest.mock import AsyncMock, patch, MagicMock
 from litellm.caching.caching_handler import LLMCachingHandler, CachingHandlerResponse
@@ -594,6 +595,56 @@ async def test_async_responses_api_caching():
     assert cached_response.cached_result._hidden_params["cache_hit"] == True
 
 
+@pytest.mark.asyncio
+async def test_async_get_cache_updates_request_kwargs_for_streaming_responses():
+    """
+    Ensure streamed responses retain the normalized lookup kwargs so a later
+    cache write can reuse the exact cache key from the read path.
+    """
+    setup_cache()
+
+    caching_handler = LLMCachingHandler(
+        original_function=aresponses,
+        request_kwargs={"stale": True},
+        start_time=datetime.now(),
+    )
+
+    logging_obj = LiteLLMLogging(
+        litellm_call_id=str(datetime.now()),
+        call_type=CallTypes.aresponses.value,
+        model="gpt-4o",
+        messages=[],
+        function_id=str(uuid.uuid4()),
+        stream=True,
+        start_time=datetime.now(),
+    )
+
+    kwargs = {
+        "model": "gpt-4o",
+        "input": "hello",
+        "stream": True,
+        "caching": True,
+    }
+
+    await caching_handler._async_get_cache(
+        model="gpt-4o",
+        original_function=aresponses,
+        logging_obj=logging_obj,
+        start_time=datetime.now(),
+        call_type=CallTypes.aresponses.value,
+        kwargs=kwargs,
+    )
+
+    assert "stale" not in caching_handler.request_kwargs
+    assert caching_handler.request_kwargs["model"] == "gpt-4o"
+    assert caching_handler.request_kwargs["input"] == "hello"
+    assert caching_handler.request_kwargs["stream"] is True
+    assert (
+        caching_handler.request_kwargs["cache_key"]
+        == litellm.cache.get_cache_key(**caching_handler.request_kwargs)
+    )
+
+
 def test_sync_responses_api_caching():
     """
     Test that synchronous responses API calls are properly cached and retrieved.
@@ -737,6 +788,69 @@ def test_convert_cached_responses_api_result_to_model_response():
     assert result.model == "gpt-4o"
     assert result.status == "completed"
     assert len(result.output) == 1
+
+
+def test_convert_cached_streaming_responses_result_to_iterator():
+    """
+    Test that cached streaming Responses results are replayed through a synthetic
+    streaming iterator instead of being returned as a full response object.
+    """
+    caching_handler = LLMCachingHandler(
+        original_function=responses, request_kwargs={}, start_time=datetime.now()
+    )
+
+    logging_obj = LiteLLMLogging(
+        litellm_call_id=str(datetime.now()),
+        call_type=CallTypes.responses.value,
+        model="gpt-4o",
+        messages=[],
+        function_id=str(uuid.uuid4()),
+        stream=True,
+        start_time=datetime.now(),
+    )
+
+    cached_result = {
+        "id": "resp_stream_cache_test",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": "gpt-4o",
+        "object": "response",
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_stream_cache_test",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Streaming cache replay test.",
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = caching_handler._convert_cached_result_to_model_response(
+        cached_result=cached_result,
+        call_type=CallTypes.responses.value,
+        kwargs={"model": "gpt-4o", "input": "test", "stream": True},
+        logging_obj=logging_obj,
+        model="gpt-4o",
+        args=(),
+    )
+
+    assert isinstance(result, CachedResponsesAPIStreamingIterator)
+    assert result.completed_response is not None
+    assert result.completed_response.response.id == cached_result["id"]
+
+    streamed_events = list(result)
+    assert streamed_events[-1].type == "response.completed"
+    assert streamed_events[-1].response.id == cached_result["id"]
+    assert streamed_events[-1].response.output[0].content[0].text == (
+        "Streaming cache replay test."
+    )
 
 
 @pytest.mark.asyncio

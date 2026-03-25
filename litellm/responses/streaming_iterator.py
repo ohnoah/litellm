@@ -61,6 +61,7 @@ class BaseResponsesAPIStreamingIterator:
         self.completed_response: Optional[ResponsesAPIStreamingResponse] = None
         self.start_time = getattr(logging_obj, "start_time", datetime.now())
         self._failure_handled = False  # Track if failure handler has been called
+        self._completed_response_cached = False
         self._stream_created_time: float = time.time()
 
         # track request context for hooks
@@ -215,6 +216,76 @@ class BaseResponsesAPIStreamingIterator:
     def _handle_logging_completed_response(self):
         """Base implementation - should be overridden by subclasses"""
         pass
+
+    def _get_completed_response_object(self) -> Optional[ResponsesAPIResponse]:
+        completed_response = self.completed_response
+        if isinstance(completed_response, ResponsesAPIResponse):
+            return completed_response
+
+        response_obj = getattr(completed_response, "response", None)
+        if isinstance(response_obj, ResponsesAPIResponse):
+            return response_obj
+
+        return None
+
+    def _persist_completed_response_to_cache(self, *, is_async: bool) -> None:
+        if self._completed_response_cached:
+            return
+
+        completed_response = self.completed_response
+        if (
+            getattr(completed_response, "type", None)
+            != ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+        ):
+            return
+
+        response_obj = self._get_completed_response_object()
+        if response_obj is None:
+            return
+
+        caching_handler = getattr(self.logging_obj, "_llm_caching_handler", None)
+        if caching_handler is None:
+            return
+
+        request_kwargs = getattr(caching_handler, "request_kwargs", None)
+        if not isinstance(request_kwargs, dict) or request_kwargs.get("stream") is not True:
+            return
+        request_kwargs = request_kwargs.copy()
+        preset_cache_key = getattr(caching_handler, "preset_cache_key", None)
+        request_cache_key = request_kwargs.pop("cache_key", None)
+        if preset_cache_key is None:
+            preset_cache_key = request_cache_key
+        if request_kwargs.get("metadata") is None:
+            request_kwargs.pop("metadata", None)
+        request_kwargs.pop("custom_llm_provider", None)
+        if preset_cache_key is not None:
+            request_kwargs["cache_key"] = preset_cache_key
+
+        if not caching_handler._should_store_result_in_cache(
+            original_function=caching_handler.original_function,
+            kwargs=request_kwargs,
+        ):
+            return
+
+        if litellm.cache is None:
+            return
+
+        cached_response = response_obj.model_dump_json()
+        if is_async:
+            asyncio.create_task(
+                litellm.cache.async_add_cache(
+                    cached_response,
+                    dynamic_cache_object=getattr(caching_handler, "dual_cache", None),
+                    **request_kwargs,
+                )
+            )
+        else:
+            litellm.cache.add_cache(
+                cached_response,
+                **request_kwargs,
+            )
+
+        self._completed_response_cached = True
 
     async def _call_post_streaming_deployment_hook(self, chunk):
         """
@@ -440,6 +511,7 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
 
     def _handle_logging_completed_response(self):
         """Handle logging for completed responses in async context"""
+        self._persist_completed_response_to_cache(is_async=True)
         # Create a copy for logging to avoid modifying the response object that will be returned to the user
         # The logging handlers may transform usage from Responses API format (input_tokens/output_tokens)
         # to chat completion format (prompt_tokens/completion_tokens) for internal logging
@@ -547,6 +619,7 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
 
     def _handle_logging_completed_response(self):
         """Handle logging for completed responses in sync context"""
+        self._persist_completed_response_to_cache(is_async=False)
         # Create a copy for logging to avoid modifying the response object that will be returned to the user
         # The logging handlers may transform usage from Responses API format (input_tokens/output_tokens)
         # to chat completion format (prompt_tokens/completion_tokens) for internal logging
@@ -622,9 +695,14 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
                 logging_obj=logging_obj,
             )
         )
-        full_text = self._collect_text(transformed)
+        self._set_events_from_response(transformed=transformed, logging_obj=logging_obj)
 
-        # build a list of 5‑char delta events
+    def _set_events_from_response(
+        self,
+        transformed: ResponsesAPIResponse,
+        logging_obj: LiteLLMLoggingObj,
+    ) -> None:
+        full_text = self._collect_text(transformed)
         deltas = [
             OutputTextDeltaEvent(
                 type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
@@ -651,12 +729,12 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
                     pass
 
         # append the completed event
-        self._events = deltas + [
-            ResponseCompletedEvent(
-                type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
-                response=transformed,
-            )
-        ]
+        completed_event = ResponseCompletedEvent(
+            type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+            response=transformed,
+        )
+        self.completed_response = completed_event
+        self._events = deltas + [completed_event]
         self._idx = 0
 
     def __aiter__(self):
@@ -687,6 +765,38 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
                 for c in getattr(out_item, "content", []):
                     out += c.text
         return out
+
+
+class _PassthroughResponsesAPIConfig:
+    def transform_response_api_response(
+        self,
+        model: str,
+        raw_response: ResponsesAPIResponse,
+        logging_obj: LiteLLMLoggingObj,
+    ) -> ResponsesAPIResponse:
+        return raw_response
+
+
+class CachedResponsesAPIStreamingIterator(MockResponsesAPIStreamingIterator):
+    def __init__(
+        self,
+        response: ResponsesAPIResponse,
+        logging_obj: LiteLLMLoggingObj,
+        request_data: Optional[Dict[str, Any]] = None,
+        call_type: Optional[str] = None,
+    ):
+        BaseResponsesAPIStreamingIterator.__init__(
+            self,
+            response=httpx.Response(200),
+            model=getattr(response, "model", ""),
+            responses_api_provider_config=_PassthroughResponsesAPIConfig(),
+            logging_obj=logging_obj,
+            litellm_metadata=None,
+            custom_llm_provider="cached_response",
+            request_data=request_data,
+            call_type=call_type,
+        )
+        self._set_events_from_response(transformed=response, logging_obj=logging_obj)
 
 
 # ---------------------------------------------------------------------------
