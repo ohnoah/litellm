@@ -23,9 +23,25 @@ from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import (
+    BaseLiteLLMOpenAIResponseObject,
+    ContentPartAddedEvent,
+    ContentPartDoneEvent,
+    ContentPartDonePartOutputText,
+    ContentPartDonePartReasoningText,
+    ContentPartDonePartRefusal,
+    FunctionCallArgumentsDeltaEvent,
+    FunctionCallArgumentsDoneEvent,
     OutputTextDeltaEvent,
+    OutputTextAnnotationAddedEvent,
+    OutputTextDoneEvent,
+    OutputItemAddedEvent,
+    OutputItemDoneEvent,
+    RefusalDeltaEvent,
+    RefusalDoneEvent,
     ResponseAPIUsage,
+    ResponseCreatedEvent,
     ResponseCompletedEvent,
+    ResponseInProgressEvent,
     ResponsesAPIRequestParams,
     ResponsesAPIResponse,
     ResponsesAPIStreamEvents,
@@ -46,7 +62,7 @@ class BaseResponsesAPIStreamingIterator:
         self,
         response: httpx.Response,
         model: str,
-        responses_api_provider_config: BaseResponsesAPIConfig,
+        responses_api_provider_config: Optional[BaseResponsesAPIConfig],
         logging_obj: LiteLLMLoggingObj,
         litellm_metadata: Optional[Dict[str, Any]] = None,
         custom_llm_provider: Optional[str] = None,
@@ -123,6 +139,10 @@ class BaseResponsesAPIStreamingIterator:
 
             # Format as ResponsesAPIStreamingResponse
             if isinstance(parsed_chunk, dict):
+                if self.responses_api_provider_config is None:
+                    raise ValueError(
+                        "responses_api_provider_config is required to process live streaming chunks"
+                    )
                 openai_responses_api_chunk = (
                     self.responses_api_provider_config.transform_streaming_response(
                         model=self.model,
@@ -676,24 +696,20 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         request_data: Optional[Dict[str, Any]] = None,
         call_type: Optional[str] = None,
     ):
-        super().__init__(
-            response=response,
+        transformed = responses_api_provider_config.transform_response_api_response(
             model=model,
-            responses_api_provider_config=responses_api_provider_config,
+            raw_response=response,
+            logging_obj=logging_obj,
+        )
+        super().__init__(
+            response=httpx.Response(200),
+            model=model,
+            responses_api_provider_config=None,
             logging_obj=logging_obj,
             litellm_metadata=litellm_metadata,
             custom_llm_provider=custom_llm_provider,
             request_data=request_data,
             call_type=call_type,
-        )
-
-        # one-time transform
-        transformed = (
-            self.responses_api_provider_config.transform_response_api_response(
-                model=self.model,
-                raw_response=response,
-                logging_obj=logging_obj,
-            )
         )
         self._set_events_from_response(transformed=transformed, logging_obj=logging_obj)
 
@@ -702,40 +718,13 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         transformed: ResponsesAPIResponse,
         logging_obj: LiteLLMLoggingObj,
     ) -> None:
-        full_text = self._collect_text(transformed)
-        deltas = [
-            OutputTextDeltaEvent(
-                type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
-                delta=full_text[i : i + self.CHUNK_SIZE],
-                item_id=transformed.id,
-                output_index=0,
-                content_index=0,
-            )
-            for i in range(0, len(full_text), self.CHUNK_SIZE)
-        ]
-
-        # Add cost to usage object if include_cost_in_streaming_usage is True
-        if litellm.include_cost_in_streaming_usage and logging_obj is not None:
-            usage_obj: Optional[ResponseAPIUsage] = getattr(transformed, "usage", None)
-            if usage_obj is not None:
-                try:
-                    cost: Optional[float] = logging_obj._response_cost_calculator(
-                        result=transformed
-                    )
-                    if cost is not None:
-                        setattr(usage_obj, "cost", cost)
-                except Exception:
-                    # If cost calculation fails, continue without cost
-                    pass
-
-        # append the completed event
-        completed_event = ResponseCompletedEvent(
-            type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
-            response=transformed,
+        self._events = _build_synthetic_response_events(
+            transformed=transformed,
+            logging_obj=logging_obj,
+            chunk_size=self.CHUNK_SIZE,
         )
-        self.completed_response = completed_event
-        self._events = deltas + [completed_event]
         self._idx = 0
+        self.completed_response = self._events[-1]
 
     def __aiter__(self):
         return self
@@ -767,16 +756,6 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         return out
 
 
-class _PassthroughResponsesAPIConfig:
-    def transform_response_api_response(
-        self,
-        model: str,
-        raw_response: ResponsesAPIResponse,
-        logging_obj: LiteLLMLoggingObj,
-    ) -> ResponsesAPIResponse:
-        return raw_response
-
-
 class CachedResponsesAPIStreamingIterator(MockResponsesAPIStreamingIterator):
     def __init__(
         self,
@@ -789,7 +768,7 @@ class CachedResponsesAPIStreamingIterator(MockResponsesAPIStreamingIterator):
             self,
             response=httpx.Response(200),
             model=getattr(response, "model", ""),
-            responses_api_provider_config=_PassthroughResponsesAPIConfig(),
+            responses_api_provider_config=None,
             logging_obj=logging_obj,
             litellm_metadata=None,
             custom_llm_provider="cached_response",
@@ -797,6 +776,247 @@ class CachedResponsesAPIStreamingIterator(MockResponsesAPIStreamingIterator):
             call_type=call_type,
         )
         self._set_events_from_response(transformed=response, logging_obj=logging_obj)
+
+
+def _dump_response_object(obj: Any) -> Dict[str, Any]:
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+def _build_response_status_event(
+    event_type: ResponsesAPIStreamEvents,
+    transformed: ResponsesAPIResponse,
+) -> ResponsesAPIStreamingResponse:
+    in_progress_response = transformed.model_copy(
+        deep=True,
+        update={"status": "in_progress", "output": []},
+    )
+    if event_type == ResponsesAPIStreamEvents.RESPONSE_CREATED:
+        return ResponseCreatedEvent(type=event_type, response=in_progress_response)
+    return ResponseInProgressEvent(type=event_type, response=in_progress_response)
+
+
+def _build_content_part_done_event(
+    *,
+    item_id: str,
+    output_index: int,
+    content_index: int,
+    part_payload: Dict[str, Any],
+) -> Optional[ContentPartDoneEvent]:
+    part_type = part_payload.get("type")
+    if part_type == "output_text":
+        annotations = [
+            BaseLiteLLMOpenAIResponseObject(**annotation)
+            for annotation in part_payload.get("annotations", []) or []
+        ]
+        part = ContentPartDonePartOutputText(
+            type="output_text",
+            text=str(part_payload.get("text") or ""),
+            annotations=annotations,
+            logprobs=part_payload.get("logprobs"),
+        )
+    elif part_type == "refusal":
+        part = ContentPartDonePartRefusal(
+            type="refusal",
+            refusal=str(part_payload.get("refusal") or ""),
+        )
+    elif part_type == "reasoning_text":
+        part = ContentPartDonePartReasoningText(
+            type="reasoning_text",
+            reasoning=str(part_payload.get("reasoning") or ""),
+        )
+    else:
+        return None
+
+    return ContentPartDoneEvent(
+        type=ResponsesAPIStreamEvents.CONTENT_PART_DONE,
+        item_id=item_id,
+        output_index=output_index,
+        content_index=content_index,
+        part=part,
+    )
+
+
+def _add_text_like_part_events(
+    *,
+    events: List[ResponsesAPIStreamingResponse],
+    item_id: str,
+    output_index: int,
+    content_index: int,
+    part_payload: Dict[str, Any],
+    chunk_size: int,
+) -> None:
+    part_type = part_payload.get("type")
+    if part_type == "output_text":
+        text = str(part_payload.get("text") or "")
+        for i in range(0, len(text), chunk_size):
+            events.append(
+                OutputTextDeltaEvent(
+                    type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    delta=text[i : i + chunk_size],
+                )
+            )
+        for annotation_index, annotation in enumerate(
+            part_payload.get("annotations", []) or []
+        ):
+            events.append(
+                OutputTextAnnotationAddedEvent(
+                    type=ResponsesAPIStreamEvents.OUTPUT_TEXT_ANNOTATION_ADDED,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    annotation_index=annotation_index,
+                    annotation=annotation,
+                )
+            )
+        events.append(
+            OutputTextDoneEvent(
+                type=ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
+                item_id=item_id,
+                output_index=output_index,
+                content_index=content_index,
+                text=text,
+            )
+        )
+    elif part_type == "refusal":
+        refusal = str(part_payload.get("refusal") or "")
+        for i in range(0, len(refusal), chunk_size):
+            events.append(
+                RefusalDeltaEvent(
+                    type=ResponsesAPIStreamEvents.REFUSAL_DELTA,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    delta=refusal[i : i + chunk_size],
+                )
+            )
+        events.append(
+            RefusalDoneEvent(
+                type=ResponsesAPIStreamEvents.REFUSAL_DONE,
+                item_id=item_id,
+                output_index=output_index,
+                content_index=content_index,
+                refusal=refusal,
+            )
+        )
+
+
+def _build_synthetic_response_events(
+    *,
+    transformed: ResponsesAPIResponse,
+    logging_obj: LiteLLMLoggingObj,
+    chunk_size: int,
+) -> List[ResponsesAPIStreamingResponse]:
+    if litellm.include_cost_in_streaming_usage and logging_obj is not None:
+        usage_obj: Optional[ResponseAPIUsage] = getattr(transformed, "usage", None)
+        if usage_obj is not None:
+            try:
+                cost: Optional[float] = logging_obj._response_cost_calculator(
+                    result=transformed
+                )
+                if cost is not None:
+                    setattr(usage_obj, "cost", cost)
+            except Exception:
+                pass
+
+    events: List[ResponsesAPIStreamingResponse] = [
+        _build_response_status_event(
+            ResponsesAPIStreamEvents.RESPONSE_CREATED, transformed
+        ),
+        _build_response_status_event(
+            ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS, transformed
+        ),
+    ]
+
+    sequence_number = 0
+    for output_index, output_item in enumerate(
+        getattr(transformed, "output", []) or []
+    ):
+        output_item_payload = _dump_response_object(output_item)
+        item_id = str(output_item_payload.get("id") or transformed.id)
+        item_type = output_item_payload.get("type")
+
+        events.append(
+            OutputItemAddedEvent(
+                type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+                output_index=output_index,
+                item=BaseLiteLLMOpenAIResponseObject(**output_item_payload),
+            )
+        )
+
+        if item_type == "message":
+            for content_index, part in enumerate(
+                output_item_payload.get("content", []) or []
+            ):
+                part_payload = _dump_response_object(part)
+                events.append(
+                    ContentPartAddedEvent(
+                        type=ResponsesAPIStreamEvents.CONTENT_PART_ADDED,
+                        item_id=item_id,
+                        output_index=output_index,
+                        content_index=content_index,
+                        part=BaseLiteLLMOpenAIResponseObject(**part_payload),
+                    )
+                )
+                _add_text_like_part_events(
+                    events=events,
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    part_payload=part_payload,
+                    chunk_size=chunk_size,
+                )
+                done_event = _build_content_part_done_event(
+                    item_id=item_id,
+                    output_index=output_index,
+                    content_index=content_index,
+                    part_payload=part_payload,
+                )
+                if done_event is not None:
+                    events.append(done_event)
+        elif item_type == "function_call":
+            arguments = str(output_item_payload.get("arguments") or "")
+            for i in range(0, len(arguments), chunk_size):
+                events.append(
+                    FunctionCallArgumentsDeltaEvent(
+                        type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
+                        item_id=item_id,
+                        output_index=output_index,
+                        delta=arguments[i : i + chunk_size],
+                    )
+                )
+            events.append(
+                FunctionCallArgumentsDoneEvent(
+                    type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE,
+                    item_id=item_id,
+                    output_index=output_index,
+                    arguments=arguments,
+                )
+            )
+
+        sequence_number += 1
+        events.append(
+            OutputItemDoneEvent(
+                type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                output_index=output_index,
+                sequence_number=sequence_number,
+                item=BaseLiteLLMOpenAIResponseObject(**output_item_payload),
+            )
+        )
+
+    events.append(
+        ResponseCompletedEvent(
+            type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+            response=transformed,
+        )
+    )
+    return events
 
 
 # ---------------------------------------------------------------------------
